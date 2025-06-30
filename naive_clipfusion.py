@@ -1,3 +1,4 @@
+import os
 import torch
 import numpy as np
 from PIL import Image
@@ -14,9 +15,18 @@ from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 # PyTorch3D imports for robust projection
 from pytorch3d.renderer import PerspectiveCameras
 
+from naive_utils import *
+from clip_gradcam import gradCAM
+
+
 # --- Main Configuration ---
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+
+IMAGE_FOLDER = "examples/room/images"
+all_files = os.listdir(IMAGE_FOLDER)
+image_extensions = ('.png', '.jpg', '.jpeg')
+
 
 # --- 1. MODEL LOADING ---
 
@@ -32,13 +42,19 @@ clip_model = CLIPModel.from_pretrained(LOCAL_CLIP_PATH).to(DEVICE)
 clip_processor = CLIPProcessor.from_pretrained(LOCAL_CLIP_PATH)
 print("All models loaded successfully!")
 
+
 # --- 2. 3D SCENE RECONSTRUCTION (with VGGT) ---
 print("\nReconstructing scene with VGGT...")
 # Replace with your image paths
-image_paths = ["examples/room/images/no_overlap_2.jpg"]
+image_list = [
+    os.path.join(IMAGE_FOLDER, f)
+    for f in all_files
+    if f.lower().endswith(image_extensions)
+]
+
 
 # Load images and get their shape
-images_for_vggt = load_and_preprocess_images(image_paths).to(DEVICE)
+images_for_vggt = load_and_preprocess_images(image_list).to(DEVICE)
 _, _, H, W = images_for_vggt.shape
 print(f"Loaded images and derived shape: H={H}, W={W}")
 
@@ -47,15 +63,25 @@ with torch.no_grad():
     with torch.amp.autocast("cuda", dtype=DTYPE):
         batched_images = images_for_vggt.unsqueeze(0)
         aggregated_tokens_list, ps_idx = vggt_model.aggregator(batched_images)
-        pose_enc = vggt_model.camera_head(aggregated_tokens_list)[-1]
-        vggt_extrinsics, vggt_intrinsics = pose_encoding_to_extri_intri(pose_enc, images_for_vggt.shape[-2:])
-        depth_map, _ = vggt_model.depth_head(aggregated_tokens_list, batched_images, ps_idx)
 
-# --- Construct 3D Points ---
+        # Predict Cameras
+        pose_enc = vggt_model.camera_head(aggregated_tokens_list)[-1]
+
+        # Extrinsic and intrinsic matrices, following OpenCV convention (camera from world)
+        vggt_extrinsics, vggt_intrinsics = pose_encoding_to_extri_intri(pose_enc, images_for_vggt.shape[-2:])
+
+        # Predict Depth Maps
+        depth_map, depth_conf = vggt_model.depth_head(aggregated_tokens_list, batched_images, ps_idx)
+
+        # Predict Point Maps
+        point_map, point_conf = vggt_model.point_head(aggregated_tokens_list, batched_images, ps_idx)
+
+
+# --- Construct 3D Points from Depth Maps and Cameras---
 point_cloud_3d = unproject_depth_map_to_point_map(
-    depth_map.squeeze(0),
-    vggt_extrinsics.squeeze(0),
-    vggt_intrinsics.squeeze(0)
+    depth_map.cpu().numpy().squeeze(0),
+    vggt_extrinsics.cpu().numpy().squeeze(0),
+    vggt_intrinsics.cpu().numpy().squeeze(0)
 )
 
 # Convert to PyTorch tensor if it's a NumPy array and move to device
@@ -68,20 +94,33 @@ else:
 
 # Reshape from (H*W, 3) to a more usable list of points
 point_cloud_3d = point_cloud_3d.reshape(-1, 3)
+
 # Optional: Downsample point cloud for faster processing if it's too dense
-point_cloud_3d = point_cloud_3d[::10, :]
+# point_cloud_3d = point_cloud_3d[::10, :]
+
 print(f"Reconstructed a point cloud with {point_cloud_3d.shape[0]} points.")
+# Call this function after you create point_cloud_3d
+save_point_cloud_to_ply(point_cloud_3d, "reconstructed.ply")
+
 
 # --- 3. 2D FEATURE EXTRACTION (with CLIP) ---
 print("\nExtracting 2D features with CLIP...")
-pil_images = [Image.open(p) for p in image_paths]
+pil_images = [Image.open(p) for p in image_list]
 image_inputs = clip_processor(images=pil_images, return_tensors="pt").to(DEVICE)
 
-# Extract CLIP image features (these are in the shared embedding space)
-with torch.no_grad():
-    image_features = clip_model.get_image_features(pixel_values=image_inputs.pixel_values)
+# debug_clip_model_structure(clip_model)
 
-print(f"Extracted image features with shape: {image_features.shape}")
+dense_features_list, global_features_list = extract_dense_clip_features(pil_images, clip_model, clip_processor, device=DEVICE)
+print(f"Extracted dense features: {len(dense_features_list)} images, each with shape {dense_features_list[0].shape}")
+
+
+# Visualize the extracted image features
+image_caption = 'a bed'
+text_inputs = clip_processor(text=[image_caption], return_tensors="pt").to(DEVICE)
+
+#TODO: Integrate gradCAM here to visualize CLIP attention map
+
+
 
 # --- 4. ROBUST FEATURE LIFTING (with PyTorch3D) ---
 print("\nLifting 2D features to 3D point cloud...")
@@ -89,7 +128,7 @@ num_points = point_cloud_3d.shape[0]
 num_views = len(pil_images)
 
 # Initialize point features in CLIP embedding space
-point_features_sum = torch.zeros(num_points, image_features.shape[1], device=DEVICE)
+point_features_sum = torch.zeros(num_points, 512, device=DEVICE)  # Changed to 512
 point_view_count = torch.zeros(num_points, device=DEVICE)
 
 vggt_extrinsics_squeezed = vggt_extrinsics.squeeze(0)
@@ -111,58 +150,67 @@ for i in range(num_views):
     # Project 3D points to 2D
     projected_points = cameras.transform_points(point_cloud_3d.unsqueeze(0))
 
+    # Convert to pixel coordinates
     u, v, z = projected_points[0, ..., 0], projected_points[0, ..., 1], projected_points[0, ..., 2]
-    visible_mask = (z > 0) & (u.abs() < 1) & (v.abs() < 1)
 
-    # Assign CLIP image features to visible points
-    point_features_sum[visible_mask] += image_features[i]
-    point_view_count[visible_mask] += 1
+    # Convert from normalized coordinates [-1, 1] to pixel coordinates
+    pixel_u = ((u + 1) * W / 2).long()
+    pixel_v = ((v + 1) * H / 2).long()
 
-# Average the features
+    # Visibility mask
+    visible_mask = (z > 0) & (pixel_u >= 0) & (pixel_u < W) & (pixel_v >= 0) & (pixel_v < H)
+
+    # Map pixel coordinates to patch coordinates
+    patch_size = dense_features_list[i].shape[0]  # 7 for ViT-B/32
+    patch_u = (pixel_u * patch_size / W).long().clamp(0, patch_size - 1)
+    patch_v = (pixel_v * patch_size / H).long().clamp(0, patch_size - 1)
+
+    # Get spatial features for visible points
+    spatial_features = dense_features_list[i].to(DEVICE)  # (7, 7, 512)
+
+    for j in range(num_points):
+        if visible_mask[j]:
+            # Get the corresponding patch feature (now already in 512-dim space)
+            patch_feature = spatial_features[patch_v[j], patch_u[j]]  # (512,)
+            point_features_sum[j] += patch_feature
+            point_view_count[j] += 1
+
+# Average features and project to CLIP embedding space
 avg_point_features = point_features_sum / (point_view_count.unsqueeze(-1) + 1e-8)
 print("Feature lifting complete.")
 
+
 # --- 5. OPEN-VOCABULARY SEGMENTATION ---
 print("\nPerforming zero-shot segmentation...")
-text_query = "a red chair"
+text_query = "a photo of a chair"
 
 with torch.no_grad():
-    text_inputs = clip_processor(text=[text_query], return_tensors="pt", padding=True).to(DEVICE)
+    text_inputs = clip_processor(text=[text_query], return_tensors="pt").to(DEVICE)
     text_features = clip_model.get_text_features(**text_inputs)
 
-    # Normalize features for cosine similarity
-    avg_point_features_norm = F.normalize(avg_point_features, p=2, dim=-1)
+    # Now both features are in the same space!
+    point_features_norm = F.normalize(avg_point_features, p=2, dim=-1)
     text_features_norm = F.normalize(text_features, p=2, dim=-1)
 
-    # Compute similarity scores
-    similarity_scores = (avg_point_features_norm @ text_features_norm.T).squeeze()
+    similarity_scores = (point_features_norm @ text_features_norm.T).squeeze()
 
-    # Debug: Print similarity score statistics
+    # Debug: Check for points with valid features
+    valid_points = (point_view_count > 0)
+    print(f"Points with valid features: {valid_points.sum()}")
+
     print(
         f"Similarity scores - Min: {similarity_scores.min():.4f}, Max: {similarity_scores.max():.4f}, Mean: {similarity_scores.mean():.4f}")
 
-    # Use a more adaptive threshold or percentile-based approach
-    segmentation_threshold = 0.15  # Lower threshold
-    # Alternative: use top percentile
-    # segmentation_threshold = torch.quantile(similarity_scores, 0.7).item()
+    # Use percentile-based threshold
+    percentile_threshold = torch.quantile(similarity_scores[valid_points], 0.7).item()
+    absolute_threshold = 0.15  # Reasonable threshold for CLIP similarities
 
+    segmentation_threshold = max(percentile_threshold, absolute_threshold)
     segmentation_mask = (similarity_scores > segmentation_threshold).cpu().numpy()
+
     num_segmented_points = segmentation_mask.sum()
+
     print(
         f"Segmentation complete. Found {num_segmented_points} points for query: '{text_query}' (threshold: {segmentation_threshold:.3f})")
 
-# --- 6. VISUALIZATION (Conceptual Example) ---
-try:
-    import open3d as o3d
-
-    pcd = o3d.geometry.PointCloud()
-    # Here, we move to CPU and convert to numpy ONLY for visualization
-    pcd.points = o3d.utility.Vector3dVector(point_cloud_3d.cpu().numpy())
-    colors = np.full((num_points, 3), 0.5)
-    colors[segmentation_mask] = [1, 0, 0]
-    pcd.colors = o3d.utility.Vector3dVector(colors)
-    print("\nDisplaying 3D point cloud. Close the window to exit.")
-    o3d.visualization.draw_geometries([pcd])
-except ImportError:
-    print("\nOpen3D not installed. Skipping visualization.")
-    print("To visualize, run: pip install open3d")
+    save_colored_point_cloud_to_ply(point_cloud_3d, segmentation_mask, "segmented_point_cloud.ply")
