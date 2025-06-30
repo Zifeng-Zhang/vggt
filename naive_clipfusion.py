@@ -16,17 +16,16 @@ from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 from pytorch3d.renderer import PerspectiveCameras
 
 from naive_utils import *
-from clip_gradcam import gradCAM
-
+# Import the new HuggingFace-compatible GradCAM functions
+from naive_gradcam import visualize_gradcam_hf_clip, get_available_layers
 
 # --- Main Configuration ---
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE = "cuda:1" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8 else torch.float16
 
 IMAGE_FOLDER = "examples/room/images"
 all_files = os.listdir(IMAGE_FOLDER)
 image_extensions = ('.png', '.jpg', '.jpeg')
-
 
 # --- 1. MODEL LOADING ---
 
@@ -42,7 +41,6 @@ clip_model = CLIPModel.from_pretrained(LOCAL_CLIP_PATH).to(DEVICE)
 clip_processor = CLIPProcessor.from_pretrained(LOCAL_CLIP_PATH)
 print("All models loaded successfully!")
 
-
 # --- 2. 3D SCENE RECONSTRUCTION (with VGGT) ---
 print("\nReconstructing scene with VGGT...")
 # Replace with your image paths
@@ -51,7 +49,6 @@ image_list = [
     for f in all_files
     if f.lower().endswith(image_extensions)
 ]
-
 
 # Load images and get their shape
 images_for_vggt = load_and_preprocess_images(image_list).to(DEVICE)
@@ -75,7 +72,6 @@ with torch.no_grad():
 
         # Predict Point Maps
         point_map, point_conf = vggt_model.point_head(aggregated_tokens_list, batched_images, ps_idx)
-
 
 # --- Construct 3D Points from Depth Maps and Cameras---
 point_cloud_3d = unproject_depth_map_to_point_map(
@@ -102,7 +98,6 @@ print(f"Reconstructed a point cloud with {point_cloud_3d.shape[0]} points.")
 # Call this function after you create point_cloud_3d
 save_point_cloud_to_ply(point_cloud_3d, "reconstructed.ply")
 
-
 # --- 3. 2D FEATURE EXTRACTION (with CLIP) ---
 print("\nExtracting 2D features with CLIP...")
 pil_images = [Image.open(p) for p in image_list]
@@ -110,16 +105,9 @@ image_inputs = clip_processor(images=pil_images, return_tensors="pt").to(DEVICE)
 
 # debug_clip_model_structure(clip_model)
 
-dense_features_list, global_features_list = extract_dense_clip_features(pil_images, clip_model, clip_processor, device=DEVICE)
+dense_features_list, global_features_list = extract_dense_clip_features(pil_images, clip_model, clip_processor,
+                                                                        device=DEVICE)
 print(f"Extracted dense features: {len(dense_features_list)} images, each with shape {dense_features_list[0].shape}")
-
-
-# Visualize the extracted image features
-image_caption = 'a bed'
-text_inputs = clip_processor(text=[image_caption], return_tensors="pt").to(DEVICE)
-
-#TODO: Integrate gradCAM here to visualize CLIP attention map
-
 
 
 # --- 4. ROBUST FEATURE LIFTING (with PyTorch3D) ---
@@ -179,7 +167,6 @@ for i in range(num_views):
 avg_point_features = point_features_sum / (point_view_count.unsqueeze(-1) + 1e-8)
 print("Feature lifting complete.")
 
-
 # --- 5. OPEN-VOCABULARY SEGMENTATION ---
 print("\nPerforming zero-shot segmentation...")
 text_query = "a photo of a chair"
@@ -214,3 +201,10 @@ with torch.no_grad():
         f"Segmentation complete. Found {num_segmented_points} points for query: '{text_query}' (threshold: {segmentation_threshold:.3f})")
 
     save_colored_point_cloud_to_ply(point_cloud_3d, segmentation_mask, "segmented_point_cloud.ply")
+
+print("\n=== Pipeline Complete! ===")
+print("Generated files:")
+print("- reconstructed.ply: Full 3D point cloud")
+print("- segmented_point_cloud.ply: Segmented point cloud")
+print("- gradcam_*.png: GradCAM visualizations")
+print("- Use MeshLab or similar tools to view PLY files")
